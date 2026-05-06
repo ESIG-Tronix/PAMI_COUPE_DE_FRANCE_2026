@@ -47,7 +47,7 @@ const int led = 2;
 long virageTicks = 650;
 const float PPR = 1400.0;
 const float DIAMETRE_MM = 38.0;
-const float ENTRAXE_MM = 81; //81.98 officiel mais avec glissement etc => marge corrige grace a  ENTRAXE_MM = 80.4 * (180 / 160) = 90.45 et antoine a noté 86
+const float ENTRAXE_MM = 81; 
 const float MM_PAR_PULSE = (PI * DIAMETRE_MM) / PPR;
 const float COMPENS_GAUCHE = 1.12; //0.925 ded base
 volatile long pulseCount_D = 0; volatile long pulseCount_G = 0;
@@ -66,7 +66,7 @@ DFRobot_VL6180X tof3(0x29, &Wire);
  
 //Timer
 unsigned long temps = 0;
-const unsigned long delai = 3000;
+const unsigned long delai = 85000;
 const unsigned long match = 100000;
 
 //Evitement
