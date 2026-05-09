@@ -66,7 +66,7 @@ DFRobot_VL6180X tof3(0x29, &Wire);
  
 //Timer
 unsigned long temps = 0;
-const unsigned long delai = 3000;
+const unsigned long delai = 3000; //pour les matchs mettre 85000
 const unsigned long match = 100000;
 
 //Evitement
