@@ -327,13 +327,13 @@ void loop() {
                 digitalWrite(2, HIGH);
                 dec1 = -50;
                 dec2 = -200;
-                dec3 = 400; //A CHANGER AVANT MATCH
+                dec3 = 200; //A CHANGER AVANT MATCH
             }
             else{   //low = équipe jaune
                 digitalWrite(2, LOW);
                 dec1 = 50;
                 dec2 = 200;
-                dec3 = 400;    //A CHANGER AVANT MATCH
+                dec3 = -200;    //A CHANGER AVANT MATCH
             }
             if (temps > 0 && millis() - temps >= delai){
                 pulseCount_D = 0; pulseCount_G = 0;
