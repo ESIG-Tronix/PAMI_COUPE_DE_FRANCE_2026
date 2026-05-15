@@ -338,6 +338,14 @@ void loop() {
                 dec3 = 300;    //A CHANGER AVANT MATCH
                 dec4 = -200;
             }
+
+             //Pour verifier que la tirette est bien mise
+            if (digitalRead(tirette) == LOW){  
+                digitalWrite(2, HIGH);
+                delay(50);
+                digitalWrite(2,LOW);
+            } 
+            
             if (temps > 0 && millis() - temps >= delai){
                 pulseCount_D = 0; pulseCount_G = 0;
                 prev_pulses_D = 0; prev_pulses_G = 0;
