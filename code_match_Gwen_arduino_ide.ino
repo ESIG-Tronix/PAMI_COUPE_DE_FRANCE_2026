@@ -75,6 +75,7 @@ float dec2 = 0;
 
 //destination
 float dec3 = 0;
+float dec4 = 0;
 
  
 //==========================================================================
@@ -327,13 +328,15 @@ void loop() {
                 digitalWrite(2, HIGH);
                 dec1 = -50;
                 dec2 = -200;
-                dec3 = 200; //A CHANGER AVANT MATCH
+                dec3 = 300; //A CHANGER AVANT MATCH
+                dec4 = 300;
             }
             else{   //low = équipe jaune
                 digitalWrite(2, LOW);
                 dec1 = 50;
                 dec2 = 200;
-                dec3 = -200;    //A CHANGER AVANT MATCH
+                dec3 = -300;    //A CHANGER AVANT MATCH
+                dec4 = -300;
             }
             if (temps > 0 && millis() - temps >= delai){
                 pulseCount_D = 0; pulseCount_G = 0;
@@ -350,8 +353,9 @@ void loop() {
 
             Serial.println("RETOUR ETAT AVANCER");
 
+
             if (!avancement_fixe){
-                if(goTo(450,0)){    //200 POUR LES ROBOTS QUI SONT DEVANT ET 450 POUR LE ROBOT AU FOND
+                if(goTo(300,dec4)){    //le -200 C'EST POUR EVITER LE GRAND ROBOT, FAUT CREER UNE VARIABLE SELON L'EQUIPE
                     goTo(0,0,true);
                     avancement_fixe = true;
                 }
