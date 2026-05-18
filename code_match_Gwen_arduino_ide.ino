@@ -47,7 +47,7 @@ const int led = 2;
 long virageTicks = 650;
 const float PPR = 1400.0;
 const float DIAMETRE_MM = 38.0;
-const float ENTRAXE_MM = 81; //81.98 officiel mais avec glissement etc => marge corrige grace a  ENTRAXE_MM = 80.4 * (180 / 160) = 90.45 et antoine a noté 86
+const float ENTRAXE_MM = 81; //entraxe = écart entre le milieu des 2 roues
 const float MM_PAR_PULSE = (PI * DIAMETRE_MM) / PPR;
 const float COMPENS_GAUCHE = 1.12; //0.925 ded base
 volatile long pulseCount_D = 0; volatile long pulseCount_G = 0;
@@ -320,6 +320,8 @@ void loop() {
     switch(currentState) {
         case ATTENTE:{
             setMoteurs(0,0);
+            
+             
             if (digitalRead(tirette) == HIGH && temps == 0) {
                 temps = millis();
                 Serial.println("Timer démarré");
@@ -339,13 +341,13 @@ void loop() {
                 dec4 = -300;
             }
 
-             //Pour verifier que la tirette est bien mise
+            //verifier que la tirette est bien mise pour pas qu'il parte tout seul
             if (digitalRead(tirette) == LOW){  
                 digitalWrite(2, HIGH);
                 delay(50);
                 digitalWrite(2,LOW);
             } 
-         
+
             if (temps > 0 && millis() - temps >= delai){
                 pulseCount_D = 0; pulseCount_G = 0;
                 prev_pulses_D = 0; prev_pulses_G = 0;
@@ -361,17 +363,19 @@ void loop() {
 
             Serial.println("RETOUR ETAT AVANCER");
 
+            //ajouter un autre décalage qui permet de so'rienter vers le garde manger afin de ne pas détecter un obstacle et aller dans le case EVITE
+
 
             if (!avancement_fixe){
-                if(goTo(300,dec4)){    //le -200 C'EST POUR EVITER LE GRAND ROBOT, FAUT CREER UNE VARIABLE SELON L'EQUIPE
+                if(goTo(0,dec3)){    //le -200 C'EST POUR EVITER LE GRAND ROBOT, FAUT CREER UNE VARIABLE SELON L'EQUIPE
                     goTo(0,0,true);
                     avancement_fixe = true;
                 }
             }
             else{
                 float distance = sqrt(pow(1050 - pos_x, 2) + pow(dec3 - pos_y, 2)); //A CHANGER AVANT MATCH EN FONCTIONS DES COORDONNEES DONNEES DANS LE goTo
-                if (distance > 250){
-                    if(range1 <= 45 || range2 <= 45 || range3 <= 45){
+                if (distance > 400){
+                    if(range2 <= 45 && pos_x > 400){
                         //les 2 lignes ci-dessous permettent de gagner en précision car le robot va s'arrêter et remettre phase=1 (lié au if de la ligne 120)
                         setMoteurs(0,0);
                         goTo(0,0,true);
