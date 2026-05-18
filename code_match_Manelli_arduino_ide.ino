@@ -320,6 +320,7 @@ void loop() {
     switch(currentState) {
         case ATTENTE:{
             setMoteurs(0,0);
+             
             if (digitalRead(tirette) == HIGH && temps == 0) {
                 temps = millis();
                 Serial.println("Timer démarré");
@@ -339,13 +340,13 @@ void loop() {
                 dec4 = -200;
             }
 
-             //Pour verifier que la tirette est bien mise
+            //verifier que la tirette est bien mise pour pas qu'il parte tout seul
             if (digitalRead(tirette) == LOW){  
                 digitalWrite(2, HIGH);
                 delay(50);
                 digitalWrite(2,LOW);
-            } 
-            
+            }
+
             if (temps > 0 && millis() - temps >= delai){
                 pulseCount_D = 0; pulseCount_G = 0;
                 prev_pulses_D = 0; prev_pulses_G = 0;
@@ -370,7 +371,7 @@ void loop() {
             else{
                 float distance = sqrt(pow(1500 - pos_x, 2) + pow(dec3 - pos_y, 2)); //A CHANGER AVANT MATCH EN FONCTIONS DES COORDONNEES DONNEES DANS LE goTo
                 if (distance > 250){
-                    if(range1 <= 45 || range2 <= 45 || range3 <= 45){
+                    if(range1 <= 45 || range2 <= 45 || range3 <= 45 && pos_x > 600){
                         //les 2 lignes ci-dessous permettent de gagner en précision car le robot va s'arrêter et remettre phase=1 (lié au if de la ligne 120)
                         setMoteurs(0,0);
                         goTo(0,0,true);
