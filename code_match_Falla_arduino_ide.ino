@@ -66,7 +66,7 @@ DFRobot_VL6180X tof3(0x29, &Wire);
  
 //Timer
 unsigned long temps = 0;
-const unsigned long delai = 85000;   
+const unsigned long delai = 85000;   //A CHANGER, METTRE 85000 POUR LE MATCH
 const unsigned long match = 100000;
 
 //Evitement
@@ -75,6 +75,7 @@ float dec2 = 0;
 
 //destination
 float dec3 = 0;
+float dec4 = 0;
 
  
 //==========================================================================
@@ -319,6 +320,7 @@ void loop() {
     switch(currentState) {
         case ATTENTE:{
             setMoteurs(0,0);
+
             if (digitalRead(tirette) == HIGH && temps == 0) {
                 temps = millis();
                 Serial.println("Timer démarré");
@@ -328,21 +330,23 @@ void loop() {
                 dec1 = -50;
                 dec2 = -200;
                 dec3 = -250; //A CHANGER AVANT MATCH
+                dec4 = 200;
             }
             else{   //low = équipe jaune
                 digitalWrite(2, LOW);
                 dec1 = 50;
                 dec2 = 200;
                 dec3 = 250;    //A CHANGER AVANT MATCH
+                dec4 = -200;
             }
 
-             //Pour verifier que la tirette est bien mise
-            if (digitalRead(tirette) == LOW){  
+            //verifier que la tirette est bien mise pour pas qu'il parte tout seul
+            if (digitalRead(tirette) == LOW){
                 digitalWrite(2, HIGH);
                 delay(50);
                 digitalWrite(2,LOW);
-            } 
-         
+            }
+
             if (temps > 0 && millis() - temps >= delai){
                 pulseCount_D = 0; pulseCount_G = 0;
                 prev_pulses_D = 0; prev_pulses_G = 0;
@@ -359,7 +363,7 @@ void loop() {
             Serial.println("RETOUR ETAT AVANCER");
 
             if (!avancement_fixe){
-                if(goTo(200,0)){    //200 POUR LES ROBOTS QUI SONT DEVANT ET 450 POUR LE ROBOT AU FOND
+                if(goTo(200,dec4)){    //C'EST POUR EVITER LE GRAND ROBOT, FAUT CREER UNE VARIABLE SELON L'EQUIPE
                     goTo(0,0,true);
                     avancement_fixe = true;
                 }
@@ -367,7 +371,7 @@ void loop() {
             else{
                 float distance = sqrt(pow(800 - pos_x, 2) + pow(dec3 - pos_y, 2)); //A CHANGER AVANT MATCH EN FONCTIONS DES COORDONNEES DONNEES DANS LE goTo
                 if (distance > 250){
-                    if(range1 <= 45 || range2 <= 45 || range3 <= 45){
+                    if(range2 <= 45 && pos_x > 500){
                         //les 2 lignes ci-dessous permettent de gagner en précision car le robot va s'arrêter et remettre phase=1 (lié au if de la ligne 120)
                         setMoteurs(0,0);
                         goTo(0,0,true);
