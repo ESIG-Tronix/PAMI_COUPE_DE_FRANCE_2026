@@ -1,0 +1,650 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <DFRobot_VL6180X.h>
+#include <Wire.h>
+
+// --- ÉQUIPE ---
+const bool EQUIPE_JAUNE = true; // true = jaune, false = bleu
+
+// --- PINS ---
+const int bouton    = 0;
+const int PWMA      = 14;
+const int AIN1      = 25;
+const int AIN2      = 27;
+const int encoder1A = 26;
+const int encoder2A = 13;
+const int PWMB      = 32;
+const int BIN1      = 5;
+const int BIN2      = 19;
+const int encoder1B = 22;
+const int encoder2B = 23;
+const int servo_pin = 33;
+
+// --- TOF ---
+DFRobot_VL6180X tof2(0x30, &Wire);
+const int SEUIL_TOF = 45; // mm
+
+// Zones où le ToF est désactivé (coordonnées JAUNE)
+// Format : {x_min, x_max, y_min, y_max}
+// Le miroir X est appliqué automatiquement si équipe bleue
+const float ZONES_TOF_OFF_REF[][4] = {
+    {1830, 2010, 1750, 1950},  // Frigo 1 (côté jaune)
+    {2170, 2440, 1750, 1950},  // Frigo 2 (côté jaune)
+    {2100, 2400, 1750, 1950},  // Zone chargement (côté jaune)
+};
+const int NB_ZONES_TOF_OFF = 3;
+float ZONES_TOF_OFF[NB_ZONES_TOF_OFF][4]; // remplies dans initWaypoints()
+
+// --- CONSTANTES ODOMÉTRIE ---
+const float PPR          = 1358.0;
+const float DIAMETRE_MM  = 60.0;
+const float ENTRAXE_MM   = 116.0;
+const float MM_PAR_PULSE = (PI * DIAMETRE_MM) / PPR;
+
+// --- CONSTANTES NAVIGATION ---
+const float VIT_BASE      = 150.0;
+const float VIT_FREINAGE  = 80.0;
+const float DIST_FREINAGE = 125.0;
+const float VIT_AVANCE    = 200.0;
+const float KP_ROT        = 40.0;
+const float KP_CAP        = 40.0;
+const float SEUIL_DIST    = 15.0;
+const float SEUIL_ANG     = 0.045;
+
+// --- CONSTANTES SERVO ---
+const unsigned long T_DEPLOY_MS = 1000;
+const unsigned long T_REPLI_MS  = 1000;
+
+// --- TIMER MATCH ---
+unsigned long temps = 0;
+const unsigned long delai  = 3000;
+const unsigned long match  = 100000;
+const unsigned long t_pami = 5000; // 85000 pour le vrai match
+
+// --- SERVO ---
+Servo myservo;
+unsigned long t_servo_start = 0;
+bool servo_en_repli = false;
+
+// --- WAYPOINTS ---
+struct Point {
+    float x; float y;
+    bool actif;
+    bool recaler_cap;
+    bool avec_servo;
+};
+
+const Point waypoints_ref[] = {
+    {1910, 1895, true,  false, false}, // WP0
+    {1910, 1700, true,  true,  false}, // WP1
+    {2305, 1870, true,  true,  true }, // WP2
+    {2121, 1870, true,  false, false}, // WP3
+    {2301, 1870, true,  false, false}, // WP4
+    {2275, 1900, true,  false, false}, // WP5
+};
+const int NB_WAYPOINTS = sizeof(waypoints_ref) / sizeof(waypoints_ref[0]);
+Point waypoints[NB_WAYPOINTS];
+int waypointCourant = 0;
+
+// --- CIBLES AVANCE Y- ---
+const float avance_cibles[] = {
+    1700.0, // WP0 : frigo 1
+    1700.0, // WP4 : dégagement caisses couleur
+};
+int avance_index = 0;
+
+// --- CIBLES POUSSÉE ---
+struct Cible { float x; float y; };
+const Cible poussee_cibles_ref[] = {
+    {2200.0, 1700.0}, // WP1 : poussée X- frigo 2
+};
+Cible poussee_cibles[1];
+int poussee_index = 0;
+
+// --- CIBLE RECUL ---
+float recul_cible_val = 0.0;
+char  recul_axe       = 'X';
+
+// --- ODOMÉTRIE ---
+volatile long pulseCount_D = 0;
+volatile long pulseCount_G = 0;
+long prev_pulses_D = 0;
+long prev_pulses_G = 0;
+float pos_x = 0.0, pos_y = 0.0, pos_theta = 0.0;
+
+// --- ÉTATS ---
+enum GoToState    { GOTO_IDLE, GOTO_ROTATE, GOTO_TRANSLATE, GOTO_DONE };
+enum AvanceState  { AVANCE_IDLE, AVANCE_EN_COURS, AVANCE_DONE };
+enum ReculState   { RECUL_IDLE, RECUL_EN_COURS, RECUL_DONE };
+enum RotationState{ ROT_IDLE, ROT_EN_COURS, ROT_DONE };
+enum PhaseActif   {
+    PHASE_RECALAGE_CAP,
+    PHASE_ROT_AVANT,
+    PHASE_AVANCE,
+    PHASE_RECUL,
+    PHASE_ROT_RETOUR,
+    PHASE_POUSSEE,
+    PHASE_SERVO_DEPLOY,
+    PHASE_SERVO_REPLI
+};
+enum RobotState   {
+    ATTENTE, EN_ATTENTE_PAMI, EN_ROUTE, EN_ROTATION,
+    EN_AVANCE, EN_RECUL, EN_POUSSEE, EN_SERVO, FIN
+};
+
+GoToState     gotoState   = GOTO_IDLE;
+AvanceState   avanceState = AVANCE_IDLE;
+ReculState    reculState  = RECUL_IDLE;
+RotationState rotState    = ROT_IDLE;
+PhaseActif    phaseActif  = PHASE_ROT_AVANT;
+RobotState    currentState = ATTENTE;
+
+float cible_x = 0.0, cible_y = 0.0;
+float avance_cible_y  = 0.0;
+float rot_cible_theta = 0.0;
+
+// --- ISR ---
+void IRAM_ATTR countPulse_G() {
+    if (digitalRead(encoder1A) == digitalRead(encoder2A)) pulseCount_G--;
+    else pulseCount_G++;
+}
+void IRAM_ATTR countPulse_D() {
+    if (digitalRead(encoder1B) == digitalRead(encoder2B)) pulseCount_D++;
+    else pulseCount_D--;
+}
+
+// --- UTILITAIRES ---
+float normaliserAngle(float a) {
+    while (a >  PI) a -= 2 * PI;
+    while (a < -PI) a += 2 * PI;
+    return a;
+}
+
+void stop() {
+    digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
+    ledcWrite(PWMA, 0); ledcWrite(PWMB, 0);
+}
+
+// --- TOF : ZONES OFF ---
+// Appelé dans initWaypoints() pour remplir ZONES_TOF_OFF avec miroir si bleu
+void initZonesTofOff() {
+    for (int i = 0; i < NB_ZONES_TOF_OFF; i++) {
+        if (EQUIPE_JAUNE) {
+            ZONES_TOF_OFF[i][0] = ZONES_TOF_OFF_REF[i][0];
+            ZONES_TOF_OFF[i][1] = ZONES_TOF_OFF_REF[i][1];
+        } else {
+            // Miroir X : x_new = 3000 - x_old (min↔max s'inversent)
+            ZONES_TOF_OFF[i][0] = 3000.0 - ZONES_TOF_OFF_REF[i][1];
+            ZONES_TOF_OFF[i][1] = 3000.0 - ZONES_TOF_OFF_REF[i][0];
+        }
+        // Y identique dans les deux cas
+        ZONES_TOF_OFF[i][2] = ZONES_TOF_OFF_REF[i][2];
+        ZONES_TOF_OFF[i][3] = ZONES_TOF_OFF_REF[i][3];
+    }
+}
+
+bool dansZoneTofOff() {
+    for (int i = 0; i < NB_ZONES_TOF_OFF; i++) {
+        if (pos_x >= ZONES_TOF_OFF[i][0] && pos_x <= ZONES_TOF_OFF[i][1] &&
+            pos_y >= ZONES_TOF_OFF[i][2] && pos_y <= ZONES_TOF_OFF[i][3]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool obstacleDetecte() {
+    if (dansZoneTofOff()) return false;
+    uint8_t range = tof2.rangePollMeasurement();
+    return (range <= SEUIL_TOF);
+}
+
+// --- MOTEURS ---
+void setMoteurs(float vit_D, float vit_G) {
+    float vD = vit_D, vG = vit_G;
+    if (abs(vD) > 1 && abs(vD) < 60) vD = (vD > 0) ? 60 : -60;
+    if (abs(vG) > 1 && abs(vG) < 60) vG = (vG > 0) ? 60 : -60;
+    vD = constrain(vD, -255, 255);
+    vG = constrain(vG, -255, 255);
+    digitalWrite(AIN1, vG >= 0 ? HIGH : LOW);
+    digitalWrite(AIN2, vG >= 0 ? LOW  : HIGH);
+    ledcWrite(PWMA, abs((int)vG));
+    digitalWrite(BIN1, vD >= 0 ? LOW  : HIGH);
+    digitalWrite(BIN2, vD >= 0 ? HIGH : LOW);
+    ledcWrite(PWMB, abs((int)vD));
+}
+
+// --- ODOMÉTRIE ---
+void mettreAJourPosition() {
+    noInterrupts();
+    long cD = pulseCount_D;
+    long cG = pulseCount_G;
+    interrupts();
+    float dD = (cD - prev_pulses_D) * MM_PAR_PULSE;
+    float dG = (cG - prev_pulses_G) * MM_PAR_PULSE;
+    if (abs(dD) > 20 || abs(dG) > 20) return;
+    prev_pulses_D = cD;
+    prev_pulses_G = cG;
+    float dist   = (dD + dG) / 2.0;
+    float dTheta = (dD - dG) / ENTRAXE_MM;
+    pos_theta += dTheta;
+    while (pos_theta >  PI) pos_theta -= 2 * PI;
+    while (pos_theta < -PI) pos_theta += 2 * PI;
+    pos_x += dist * cos(pos_theta);
+    pos_y += dist * sin(pos_theta);
+}
+
+// --- LANCEURS ---
+void lancerGoTo(float x, float y) {
+    cible_x = x; cible_y = y;
+    gotoState = GOTO_ROTATE;
+    Serial.printf("→ GoTo (%.0f, %.0f)\n", x, y);
+}
+
+void lancerAvance(float cible_y_mm) {
+    avance_cible_y = cible_y_mm;
+    avanceState = AVANCE_EN_COURS;
+    Serial.printf("→ Avance Y- vers %.0f\n", cible_y_mm);
+}
+
+void lancerRecul(float cible, char axe) {
+    recul_cible_val = cible;
+    recul_axe       = axe;
+    reculState      = RECUL_EN_COURS;
+    Serial.printf("→ Recul %c vers %.0f\n", axe, cible);
+}
+
+void lancerRotation(float angle_rad) {
+    rot_cible_theta = normaliserAngle(pos_theta + angle_rad);
+    rotState = ROT_EN_COURS;
+    Serial.printf("→ Rotation %.1f° | theta_cible=%.1f°\n",
+        angle_rad * 180.0 / PI,
+        rot_cible_theta * 180.0 / PI);
+}
+
+void lancerServoDeploi() {
+    myservo.write(EQUIPE_JAUNE ? 180 : 0);
+    t_servo_start  = millis();
+    servo_en_repli = false;
+    Serial.printf("→ Servo DÉPLOIEMENT (%lu ms)\n", T_DEPLOY_MS);
+}
+
+void lancerServoRepli() {
+    myservo.write(EQUIPE_JAUNE ? 0 : 180);
+    t_servo_start  = millis();
+    servo_en_repli = true;
+    Serial.printf("→ Servo REPLI (%lu ms)\n", T_REPLI_MS);
+}
+
+// --- STEP goTo ---
+bool stepGoTo() {
+    float dx   = cible_x - pos_x;
+    float dy   = cible_y - pos_y;
+    float dist = sqrt(dx*dx + dy*dy);
+
+    switch (gotoState) {
+        case GOTO_ROTATE: {
+            float angle_cible = atan2(dy, dx);
+            float err_angle   = normaliserAngle(angle_cible - pos_theta);
+            if (abs(err_angle) < SEUIL_ANG) {
+                stop(); delay(100);
+                gotoState = GOTO_TRANSLATE;
+            } else {
+                float cmd = constrain(KP_ROT * err_angle, -200.0, 200.0);
+                setMoteurs(cmd, -cmd);
+            }
+            break;
+        }
+        case GOTO_TRANSLATE: {
+            if (dist < SEUIL_DIST) {
+                stop();
+                gotoState = GOTO_DONE;
+            } else {
+                float angle_vers_cible = atan2(dy, dx);
+                float err_angle = normaliserAngle(angle_vers_cible - pos_theta);
+                if (abs(err_angle) > 0.5) { gotoState = GOTO_ROTATE; break; }
+                float vit = VIT_BASE;
+                if (dist < DIST_FREINAGE) {
+                    vit = VIT_FREINAGE + (VIT_BASE - VIT_FREINAGE)
+                          * (dist - SEUIL_DIST)
+                          / (DIST_FREINAGE - SEUIL_DIST);
+                    vit = constrain(vit, VIT_FREINAGE, VIT_BASE);
+                }
+                float correction = constrain(KP_CAP * err_angle, -80.0, 80.0);
+                setMoteurs(vit + correction, vit - correction);
+            }
+            break;
+        }
+        case GOTO_DONE: return true;
+        default: break;
+    }
+    return false;
+}
+
+// --- STEP AVANCE Y- ---
+bool stepAvance() {
+    if (avanceState == AVANCE_EN_COURS) {
+        float dist_restante = pos_y - avance_cible_y;
+        if (dist_restante < SEUIL_DIST) {
+            stop();
+            avanceState = AVANCE_DONE;
+        } else {
+            float cap_cible = -PI / 2.0;
+            float err_angle = normaliserAngle(cap_cible - pos_theta);
+            float vit = VIT_AVANCE;
+            if (dist_restante < DIST_FREINAGE) {
+                vit = VIT_FREINAGE + (VIT_AVANCE - VIT_FREINAGE)
+                      * (dist_restante - SEUIL_DIST)
+                      / (DIST_FREINAGE - SEUIL_DIST);
+                vit = constrain(vit, VIT_FREINAGE, VIT_AVANCE);
+            }
+            float correction = constrain(KP_CAP * err_angle, -80.0, 80.0);
+            setMoteurs(vit + correction, vit - correction);
+        }
+    }
+    return (avanceState == AVANCE_DONE);
+}
+
+// --- STEP RECUL ---
+bool stepRecul() {
+    if (reculState == RECUL_EN_COURS) {
+        float pos_actuelle = (recul_axe == 'X') ? pos_x : pos_y;
+        float dist_restante = EQUIPE_JAUNE
+            ? recul_cible_val - pos_actuelle
+            : pos_actuelle - recul_cible_val;
+
+        if (dist_restante < SEUIL_DIST) {
+            stop();
+            reculState = RECUL_DONE;
+        } else {
+            float vit = VIT_FREINAGE;
+            if (dist_restante < DIST_FREINAGE) {
+                vit = constrain(VIT_FREINAGE * dist_restante / DIST_FREINAGE,
+                                40.0, VIT_FREINAGE);
+            }
+            float correction = constrain(KP_CAP * normaliserAngle(
+                (EQUIPE_JAUNE ? 0.0 : PI) - pos_theta), -50.0, 50.0);
+            setMoteurs(-(vit + correction), -(vit - correction));
+        }
+    }
+    return (reculState == RECUL_DONE);
+}
+
+// --- STEP ROTATION ---
+bool stepRotation() {
+    if (rotState == ROT_EN_COURS) {
+        float err = normaliserAngle(rot_cible_theta - pos_theta);
+        if (abs(err) < SEUIL_ANG) {
+            stop(); delay(100);
+            rotState = ROT_DONE;
+        } else {
+            float cmd = constrain(KP_ROT * err, -200.0, 200.0);
+            setMoteurs(cmd, -cmd);
+        }
+    }
+    return (rotState == ROT_DONE);
+}
+
+// --- STEP SERVO ---
+bool stepServo() {
+    unsigned long duree = servo_en_repli ? T_REPLI_MS : T_DEPLOY_MS;
+    if (millis() - t_servo_start >= duree) {
+        myservo.write(90);
+        Serial.println("→ Servo arrêté (90)");
+        return true;
+    }
+    return false;
+}
+
+// --- INIT WAYPOINTS + ZONES TOF ---
+void initWaypoints() {
+    for (int i = 0; i < NB_WAYPOINTS; i++) {
+        waypoints[i] = waypoints_ref[i];
+        if (!EQUIPE_JAUNE) {
+            waypoints[i].x = 3000.0 - waypoints_ref[i].x;
+        }
+    }
+    for (int i = 0; i < 1; i++) {
+        poussee_cibles[i].y = poussee_cibles_ref[i].y;
+        poussee_cibles[i].x = EQUIPE_JAUNE
+            ? poussee_cibles_ref[i].x
+            : 3000.0 - poussee_cibles_ref[i].x;
+    }
+    initZonesTofOff();
+}
+
+// --- SETUP ---
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(17, 16);
+
+    if (tof2.begin()) Serial.println("ToF2 prêt");
+    else              Serial.println("ToF2 ERREUR");
+
+    myservo.attach(servo_pin);
+    myservo.write(90);
+    pinMode(bouton, INPUT_PULLUP);
+    pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+    pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+    pinMode(encoder1A, INPUT_PULLUP); pinMode(encoder2A, INPUT_PULLUP);
+    pinMode(encoder1B, INPUT_PULLUP); pinMode(encoder2B, INPUT_PULLUP);
+    ledcAttach(PWMA, 1000, 8);
+    ledcAttach(PWMB, 1000, 8);
+    attachInterrupt(digitalPinToInterrupt(encoder1A), countPulse_G, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(encoder1B), countPulse_D, CHANGE);
+    initWaypoints();
+}
+
+// --- LOOP ---
+void loop() {
+    mettreAJourPosition();
+
+    // Arrêt forcé fin de match
+    if (temps > 0 && millis() - temps >= match) {
+        myservo.write(90);
+        stop();
+        currentState = FIN;
+    }
+
+    switch (currentState) {
+
+        case ATTENTE:
+            stop();
+            if (digitalRead(bouton) == LOW && temps == 0) {
+                temps = millis();
+                Serial.println("=== Timer démarré ===");
+            }
+            if (temps > 0 && millis() - temps >= delai) {
+                pulseCount_D = 0; pulseCount_G = 0;
+                prev_pulses_D = 0; prev_pulses_G = 0;
+                pos_x     = EQUIPE_JAUNE ? 2275.0 : 725.0;
+                pos_y     = 1900.0;
+                pos_theta = EQUIPE_JAUNE ? PI : 0.0;
+                waypointCourant = 0;
+                avance_index    = 0;
+                poussee_index   = 0;
+                Serial.println("=== En attente départ PAMI... ===");
+                currentState = EN_ATTENTE_PAMI;
+            }
+            break;
+
+        case EN_ATTENTE_PAMI: {
+            stop();
+            if (millis() - temps >= t_pami) {
+                Serial.println("=== PAMI en route ! ===");
+                lancerGoTo(waypoints[0].x, waypoints[0].y);
+                currentState = EN_ROUTE;
+            }
+            static unsigned long t_log = 0;
+            if (millis() - t_log > 5000) {
+                Serial.printf("Attente PAMI : %.0f s\n", (millis()-temps)/1000.0);
+                t_log = millis();
+            }
+            break;
+        }
+
+        case EN_ROUTE:
+            // --- ÉVITEMENT SIMPLE : arrêt si obstacle détecté ---
+            if (obstacleDetecte()) {
+                stop();
+                Serial.println("⚠ Obstacle détecté → arrêt");
+                // On reste en EN_ROUTE : dès que l'obstacle disparaît,
+                // stepGoTo() reprend automatiquement au prochain cycle
+                break;
+            }
+            if (stepGoTo()) {
+                gotoState = GOTO_IDLE;
+                Serial.printf("=== WP%d atteint | X=%.1f Y=%.1f Th=%.1f° ===\n",
+                    waypointCourant, pos_x, pos_y, pos_theta * 180.0 / PI);
+
+                if (waypoints[waypointCourant].actif) {
+                    if (waypoints[waypointCourant].recaler_cap) {
+                        float cap_ref = EQUIPE_JAUNE ? PI : 0.0;
+                        float err_cap = normaliserAngle(cap_ref - pos_theta);
+                        phaseActif = PHASE_RECALAGE_CAP;
+                        lancerRotation(err_cap);
+                        currentState = EN_ROTATION;
+                    } else if (waypoints[waypointCourant].avec_servo) {
+                        lancerServoDeploi();
+                        phaseActif = PHASE_SERVO_DEPLOY;
+                        currentState = EN_SERVO;
+                    } else {
+                        phaseActif = PHASE_ROT_AVANT;
+                        lancerRotation(-PI / 2.0);
+                        currentState = EN_ROTATION;
+                    }
+                } else {
+                    waypointCourant++;
+                    if (waypointCourant < NB_WAYPOINTS)
+                        lancerGoTo(waypoints[waypointCourant].x, waypoints[waypointCourant].y);
+                    else
+                        currentState = FIN;
+                }
+            }
+            break;
+
+        case EN_ROTATION:
+            if (stepRotation()) {
+                rotState = ROT_IDLE;
+
+                if (phaseActif == PHASE_RECALAGE_CAP) {
+                    if (waypointCourant == 1) {
+                        phaseActif = PHASE_POUSSEE;
+                        lancerGoTo(poussee_cibles[0].x, poussee_cibles[0].y);
+                        currentState = EN_POUSSEE;
+                    } else if (waypointCourant == 2) {
+                        lancerServoDeploi();
+                        phaseActif = PHASE_SERVO_DEPLOY;
+                        currentState = EN_SERVO;
+                    } else if (waypointCourant == 4) {
+                        phaseActif = PHASE_ROT_AVANT;
+                        lancerRotation(-PI / 2.0);
+                        // reste EN_ROTATION
+                    }
+
+                } else if (phaseActif == PHASE_ROT_AVANT) {
+                    phaseActif = PHASE_AVANCE;
+                    lancerAvance(avance_cibles[avance_index]);
+                    currentState = EN_AVANCE;
+
+                } else if (phaseActif == PHASE_ROT_RETOUR) {
+                    waypointCourant++;
+                    if (waypointCourant < NB_WAYPOINTS) {
+                        lancerGoTo(waypoints[waypointCourant].x, waypoints[waypointCourant].y);
+                        currentState = EN_ROUTE;
+                    } else {
+                        currentState = FIN;
+                    }
+                }
+            }
+            break;
+
+        case EN_AVANCE:
+            if (stepAvance()) {
+                avanceState = AVANCE_IDLE;
+                avance_index++;
+                Serial.printf("=== Avance terminée | Y=%.1f ===\n", pos_y);
+
+                if (waypointCourant == 4) {
+                    lancerServoRepli();
+                    phaseActif = PHASE_SERVO_REPLI;
+                    currentState = EN_SERVO;
+                } else {
+                    phaseActif = PHASE_ROT_RETOUR;
+                    lancerRotation(+PI / 2.0);
+                    currentState = EN_ROTATION;
+                }
+            }
+            break;
+
+        case EN_RECUL:
+            if (stepRecul()) {
+                reculState = RECUL_IDLE;
+                Serial.printf("=== Recul terminé | X=%.1f ===\n", pos_x);
+                waypointCourant++;
+                float cap_ref = EQUIPE_JAUNE ? PI : 0.0;
+                float err_cap = normaliserAngle(cap_ref - pos_theta);
+                phaseActif = PHASE_RECALAGE_CAP;
+                lancerRotation(err_cap);
+                currentState = EN_ROTATION;
+            }
+            break;
+
+        case EN_POUSSEE:
+            if (stepGoTo()) {
+                gotoState = GOTO_IDLE;
+                poussee_index++;
+                Serial.printf("=== Poussée terminée | pos=(%.0f, %.0f) ===\n", pos_x, pos_y);
+                waypointCourant++;
+                if (waypointCourant < NB_WAYPOINTS) {
+                    lancerGoTo(waypoints[waypointCourant].x, waypoints[waypointCourant].y);
+                    currentState = EN_ROUTE;
+                } else {
+                    currentState = FIN;
+                }
+            }
+            break;
+
+        case EN_SERVO:
+            if (stepServo()) {
+                if (phaseActif == PHASE_SERVO_DEPLOY) {
+                    waypointCourant++;
+                    lancerGoTo(waypoints[waypointCourant].x, waypoints[waypointCourant].y);
+                    currentState = EN_ROUTE;
+                } else if (phaseActif == PHASE_SERVO_REPLI) {
+                    waypointCourant++;
+                    if (waypointCourant < NB_WAYPOINTS) {
+                        lancerGoTo(waypoints[waypointCourant].x, waypoints[waypointCourant].y);
+                        currentState = EN_ROUTE;
+                    } else {
+                        currentState = FIN;
+                    }
+                }
+            }
+            break;
+
+        case FIN:
+            stop();
+            myservo.write(90);
+            static bool affiche = false;
+            if (!affiche) {
+                Serial.println("=== PARCOURS TERMINÉ ===");
+                Serial.printf("X: %.2f | Y: %.2f | Theta: %.2f°\n",
+                    pos_x, pos_y, pos_theta * 180.0 / PI);
+                affiche = true;
+            }
+            break;
+    }
+
+    // Log de navigation
+    static unsigned long t_serial = 0;
+    if (millis() - t_serial > 200 &&
+        (currentState == EN_ROUTE || currentState == EN_AVANCE || currentState == EN_RECUL)) {
+        Serial.printf("X:%.1f Y:%.1f Th:%.1f° | WP:%d\n",
+            pos_x, pos_y, pos_theta * 180.0 / PI, waypointCourant);
+        t_serial = millis();
+    }
+
+    delay(10);
+}
